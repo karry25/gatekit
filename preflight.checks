@@ -1,0 +1,2 @@
+# gatekit's own gate: run the test suite
+python3 -m unittest discover -s tests

@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""brief - generate a paste-ready repo briefing for any AI chat.
+
+Part of gatekit. A chat-window AI cannot see your repository. brief builds the
+context it needs: stack, layout, key files, git state, and the commands that
+prove the project works. Paste the output at the start of a conversation.
+
+Stdlib only. Read-only: never modifies the repo, makes no network calls.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+from collections import Counter
+
+VERSION = "0.3.0"
+
+SKIP_DIRS = {
+    ".git", ".hg", ".svn", "node_modules", "vendor", "dist", "build",
+    ".next", ".nuxt", "__pycache__", ".venv", "venv", "env", ".tox",
+    ".mypy_cache", ".pytest_cache", "coverage", ".idea", ".vscode",
+}
+KEY_FILES = [
+    "README.md", "README", "package.json", "pyproject.toml", "setup.py",
+    "requirements.txt", "go.mod", "Cargo.toml", "Makefile", "Dockerfile",
+    "docker-compose.yml", ".gitignore", "preflight.checks",
+]
+MAX_TREE_LINES = 60
+MAX_DEPTH = 2
+
+
+def run_git(root, args):
+    try:
+        out = subprocess.run(["git", "-C", root] + args, capture_output=True,
+                             text=True, timeout=15)
+        return out.returncode, out.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return 2, ""
+
+
+def is_binary(path):
+    try:
+        with open(path, "rb") as f:
+            return b"\x00" in f.read(4096)
+    except OSError:
+        return True
+
+
+def walk(root):
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+        rel = os.path.relpath(dirpath, root)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        yield dirpath, dirnames, sorted(filenames), depth
+
+
+def build_tree(root):
+    lines, count = [], [0]
+    truncated = [False]
+
+    def add(line):
+        if count[0] < MAX_TREE_LINES:
+            lines.append(line)
+            count[0] += 1
+        else:
+            truncated[0] = True
+
+    for dirpath, dirnames, filenames, depth in walk(root):
+        rel = os.path.relpath(dirpath, root)
+        if rel != "." and depth <= MAX_DEPTH:
+            add("  " * depth + os.path.basename(dirpath) + "/")
+        if depth <= MAX_DEPTH:
+            for name in filenames:
+                add("  " * (depth + 1) + name)
+    if truncated[0]:
+        lines.append("  ... (truncated)")
+    return lines
+
+
+def extension_counts(root):
+    counts = Counter()
+    for dirpath, dirnames, filenames, _ in walk(root):
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            if is_binary(path):
+                continue
+            ext = os.path.splitext(name)[1].lower() or "(none)"
+            counts[ext] += 1
+    return counts
+
+
+def detect_stack(root, counts):
+    kinds = []
+    if os.path.isfile(os.path.join(root, "package.json")):
+        kinds.append("node")
+    if os.path.isfile(os.path.join(root, "pyproject.toml")) or \
+       os.path.isfile(os.path.join(root, "requirements.txt")) or \
+       os.path.isfile(os.path.join(root, "setup.py")):
+        kinds.append("python")
+    if os.path.isfile(os.path.join(root, "go.mod")):
+        kinds.append("go")
+    if os.path.isfile(os.path.join(root, "Cargo.toml")):
+        kinds.append("rust")
+    if os.path.isfile(os.path.join(root, "Makefile")):
+        kinds.append("make")
+    return kinds
+
+
+def key_file_highlights(root):
+    highlights = []
+    pkg = os.path.join(root, "package.json")
+    if os.path.isfile(pkg):
+        try:
+            with open(pkg, "r", encoding="utf-8", errors="replace") as f:
+                data = json.load(f)
+            bits = []
+            if data.get("name"):
+                bits.append("name: " + str(data["name"]))
+            scripts = data.get("scripts", {})
+            if scripts:
+                bits.append("scripts: " + ", ".join(sorted(scripts)))
+            highlights.append(("package.json", "; ".join(bits)))
+        except (json.JSONDecodeError, OSError):
+            highlights.append(("package.json", "(unreadable)"))
+    for name in KEY_FILES:
+        if name == "package.json":
+            continue
+        if os.path.isfile(os.path.join(root, name)):
+            highlights.append((name, "present"))
+    return highlights
+
+
+
+def python_check_command(root):
+    """Pick the repo's test command from repo evidence, not convention:
+    pytest when the repo signals pytest (config files, conftest, declared
+    dependency) or when it is installed and no tests/ dir suggests plain
+    unittest; otherwise unittest discovery when a tests/ dir exists."""
+    def contains(fname, needle):
+        path = os.path.join(root, fname)
+        if not os.path.isfile(path):
+            return False
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                return needle in f.read()
+        except OSError:
+            return False
+
+    pytest_signals = (
+        os.path.isfile(os.path.join(root, "conftest.py"))
+        or os.path.isfile(os.path.join(root, "tests", "conftest.py"))
+        or os.path.isfile(os.path.join(root, "pytest.ini"))
+        or contains("pyproject.toml", "pytest")
+        or contains("requirements.txt", "pytest")
+        or contains("setup.cfg", "pytest")
+        or contains("tox.ini", "pytest")
+    )
+    if pytest_signals:
+        return "python3 -m pytest"
+    if os.path.isdir(os.path.join(root, "tests")):
+        import importlib.util
+        if importlib.util.find_spec("pytest") is None:
+            return "python3 -m unittest discover -s tests"
+        return "python3 -m pytest"  # installed; pytest runs unittest suites too
+    return "python3 -m pytest"
+
+
+def suggested_checks(root):
+    suggested = []
+    custom = os.path.join(root, "preflight.checks")
+    if os.path.isfile(custom):
+        with open(custom, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    suggested.append(line)
+        seen, deduped = set(), []
+        for cmd in suggested:
+            if cmd not in seen:
+                seen.add(cmd)
+                deduped.append(cmd)
+        return deduped  # an explicit gate replaces auto-detection
+    pkg = os.path.join(root, "package.json")
+    if os.path.isfile(pkg):
+        try:
+            with open(pkg, "r", encoding="utf-8", errors="replace") as f:
+                scripts = json.load(f).get("scripts", {})
+            if "test" in scripts:
+                suggested.append("npm test")
+            if "build" in scripts:
+                suggested.append("npm run build")
+        except (json.JSONDecodeError, OSError):
+            pass
+    if os.path.isfile(os.path.join(root, "pyproject.toml")) or \
+       os.path.isfile(os.path.join(root, "requirements.txt")):
+        suggested.append(python_check_command(root))
+    if os.path.isfile(os.path.join(root, "go.mod")):
+        suggested.append("go test ./...")
+    if os.path.isfile(os.path.join(root, "Cargo.toml")):
+        suggested.append("cargo test")
+    mk = os.path.join(root, "Makefile")
+    if os.path.isfile(mk):
+        try:
+            with open(mk, "r", encoding="utf-8", errors="replace") as f:
+                import re
+                if re.search(r"^test\s*:", f.read(), re.M):
+                    suggested.append("make test")
+        except OSError:
+            pass
+    seen, deduped = set(), []
+    for cmd in suggested:
+        if cmd not in seen:
+            seen.add(cmd)
+            deduped.append(cmd)
+    return deduped
+
+
+def git_info(root):
+    info = {}
+    rc, top = run_git(root, ["rev-parse", "--show-toplevel"])
+    if rc != 0:
+        return info
+    _, branch = run_git(root, ["rev-parse", "--abbrev-ref", "HEAD"])
+    info["branch"] = branch or None
+    _, last = run_git(root, ["log", "-1", "--format=%cs %s"])
+    info["last_commit"] = last or None
+    _, count = run_git(root, ["rev-list", "--count", "HEAD"])
+    info["commits"] = count or None
+    return info
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="brief",
+        description="Generate a paste-ready repo briefing for an AI chat. "
+                    "Read-only, no network.")
+    parser.add_argument("path", nargs="?", default=".", help="repo path (default: .)")
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    parser.add_argument("--version", action="version", version="brief " + VERSION)
+    args = parser.parse_args(argv)
+
+    root = os.path.abspath(args.path)
+    if not os.path.isdir(root):
+        print("brief: not a directory: %s" % root, file=sys.stderr)
+        return 2
+
+    counts = extension_counts(root)
+    data = {
+        "version": VERSION,
+        "name": os.path.basename(root),
+        "root": root,
+        "stack": detect_stack(root, counts),
+        "tree": build_tree(root),
+        "key_files": key_file_highlights(root),
+        "extensions": counts.most_common(12),
+        "git": git_info(root),
+        "suggested_checks": suggested_checks(root),
+    }
+
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return 0
+
+    out = []
+    out.append("# Repo brief: %s" % data["name"])
+    out.append("")
+    out.append("Context for an AI working on this repository. Paste this at the")
+    out.append("start of the conversation.")
+    out.append("")
+    out.append("## Stack")
+    out.append("- " + (", ".join(data["stack"]) if data["stack"] else "unrecognized"))
+    if data["extensions"]:
+        top = ", ".join("%s x%d" % (e, n) for e, n in data["extensions"][:8])
+        out.append("- files by extension: " + top)
+    out.append("")
+    out.append("## Layout")
+    out.extend("    " + line for line in data["tree"])
+    out.append("")
+    if data["key_files"]:
+        out.append("## Key files")
+        for name, note in data["key_files"]:
+            out.append("- %s: %s" % (name, note))
+        out.append("")
+    if data["git"]:
+        out.append("## Git")
+        out.append("- branch: %s" % data["git"].get("branch"))
+        if data["git"].get("last_commit"):
+            out.append("- last commit: %s" % data["git"]["last_commit"])
+        if data["git"].get("commits"):
+            out.append("- commits: %s" % data["git"]["commits"])
+        out.append("")
+    if data["suggested_checks"]:
+        out.append("## Checks that prove this repo works")
+        for cmd in data["suggested_checks"]:
+            out.append("- `%s`" % cmd)
+        out.append("")
+    out.append("## Working agreement")
+    out.append("- Run the checks above before calling any change done.")
+    out.append("- Show evidence (test output, real results), not confidence.")
+    print("\n".join(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

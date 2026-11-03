@@ -1,0 +1,4 @@
+[project]
+name = "weatherd"
+version = "0.0.1"
+description = "Fictional demo project for gatekit"

@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+"""preflight - a zero-dependency pre-ship gate for any repo.
+
+Part of gatekit. Runs read-only checks by default:
+  1. git state summary
+  2. hard secret scan (known token formats)        -> errors
+  3. generic credential assignments (heuristic)    -> warnings
+  4. debug residue scan (console.log, pdb, ...)    -> warnings
+  5. project detection + suggested checks
+  6. optional: run the repo's own checks           -> errors on failure
+
+Exit codes: 0 = clear, 1 = findings/blocking failures, 2 = environment error.
+Stdlib only. The scanner itself never modifies the repo and makes no network
+calls. --run-checks is opt-in and executes the repo's own commands, which can
+do whatever those commands do - only use it on code you trust.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+VERSION = "0.3.0"
+
+def load_ignore(root):
+    """Read .preflightignore: one fnmatch pattern per line, matched against
+    repo-relative paths. Blank lines and # comments are skipped."""
+    patterns = []
+    path = os.path.join(root, ".preflightignore")
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    patterns.append(line)
+    return patterns
+
+
+def is_ignored(rel, patterns):
+    import fnmatch
+    rel = rel.replace(os.sep, "/")
+    for p in patterns:
+        if fnmatch.fnmatch(rel, p) or fnmatch.fnmatch(os.path.basename(rel), p):
+            return True
+    return False
+
+
+class OversizeFile(Exception):
+    pass
+
+
+SKIP_DIRS = {
+    ".git", ".hg", ".svn", "node_modules", "vendor", "dist", "build",
+    ".next", ".nuxt", "__pycache__", ".venv", "venv", "env", ".tox",
+    ".mypy_cache", ".pytest_cache", "coverage", ".idea", ".vscode",
+}
+MAX_FILE_BYTES = 2 * 1024 * 1024
+
+SECRET_PATTERNS = [
+    ("private key block", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP |ENCRYPTED )?PRIVATE KEY")),
+    ("AWS access key id", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("Google API key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b")),
+    ("GitHub token", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[0-9A-Za-z]{20,}\b|\bgithub_pat_[0-9A-Za-z_]{22,}\b")),
+    ("Slack token", re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{10,}\b")),
+    ("Stripe key", re.compile(r"\b(?:sk|pk)_(?:live|test)_[0-9A-Za-z]{16,}\b")),
+    ("OpenAI/Anthropic-style key", re.compile(r"\bsk-(?:proj-|ant-)[0-9A-Za-z_\-]{20,}\b")),
+    ("JWT", re.compile(r"\beyJ[0-9A-Za-z_\-]{10,}\.[0-9A-Za-z_\-]{10,}\.[0-9A-Za-z_\-]{10,}\b")),
+]
+
+GENERIC_SECRET = re.compile(
+    r"(?i)\b(?:api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?token|"
+    r"auth[_-]?token|client[_-]?secret|password|passwd)\b\s*[:=]\s*"
+    r"[\"']([^\"'\s]{12,})[\"']"
+)
+PLACEHOLDER_HINTS = ("your", "example", "changeme", "change-me", "xxxx", "****",
+                     "placeholder", "dummy", "sample", "test-test", "<", ">", "todo")
+ENV_REF_HINTS = ("os.environ", "getenv", "process.env", "ENV[", "System.getenv")
+
+RESIDUE_PATTERNS = {
+    ".js": [("console.log", re.compile(r"\bconsole\.log\(")), ("debugger", re.compile(r"^\s*debugger\s*;?", re.M))],
+    ".jsx": [("console.log", re.compile(r"\bconsole\.log\(")), ("debugger", re.compile(r"^\s*debugger\s*;?", re.M))],
+    ".ts": [("console.log", re.compile(r"\bconsole\.log\(")), ("debugger", re.compile(r"^\s*debugger\s*;?", re.M))],
+    ".tsx": [("console.log", re.compile(r"\bconsole\.log\(")), ("debugger", re.compile(r"^\s*debugger\s*;?", re.M))],
+    ".py": [("pdb breakpoint", re.compile(r"\bpdb\.set_trace\(|\bbreakpoint\("))],
+    ".rb": [("pry breakpoint", re.compile(r"\bbinding\.pry\b"))],
+}
+TODO_PATTERN = re.compile(r"\b(?:TODO|FIXME)\b")
+
+TEXT_EXTS = {
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".json", ".rb", ".go", ".rs", ".java",
+    ".c", ".h", ".cpp", ".hpp", ".cs", ".php", ".sh", ".bash", ".zsh", ".yml",
+    ".yaml", ".toml", ".ini", ".cfg", ".conf", ".env", ".md", ".txt", ".sql",
+    ".html", ".css", ".xml", ".tf", ".pl", ".pm", ".swift", ".kt", ".kts",
+}
+
+
+def is_binary(path):
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(4096)
+        return b"\x00" in chunk
+    except OSError:
+        return True
+
+
+def iter_files(root, ignore=None, ignored_paths=None):
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in filenames:
+            rel = os.path.relpath(os.path.join(dirpath, name), root)
+            if ignore and is_ignored(rel, ignore):
+                if ignored_paths is not None:
+                    ignored_paths.add(rel)
+                continue
+            full = os.path.join(dirpath, name)
+            if os.path.islink(full):
+                target = os.path.realpath(full)
+                if not (target == root or target.startswith(root + os.sep)):
+                    continue  # never follow symlinks out of the repo
+            path = os.path.join(dirpath, name)
+            ext = os.path.splitext(name)[1].lower()
+            if name == ".env" or ext in TEXT_EXTS or "." not in name:
+                yield path
+
+
+def read_text(path, max_bytes=MAX_FILE_BYTES):
+    """Return file text, or None if unreadable or over the size cap.
+    Raises OversizeFile so callers can count skipped files instead of
+    silently missing them."""
+    try:
+        if os.path.getsize(path) > max_bytes:
+            raise OversizeFile(path)
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def run_git(root, args):
+    try:
+        out = subprocess.run(["git", "-C", root] + args, capture_output=True,
+                             text=True, timeout=15)
+        return out.returncode, out.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return 2, ""
+
+
+def git_summary(root):
+    info = {"is_repo": False}
+    rc, top = run_git(root, ["rev-parse", "--show-toplevel"])
+    if rc != 0:
+        return info
+    info["is_repo"] = True
+    info["root"] = top
+    _, branch = run_git(root, ["rev-parse", "--abbrev-ref", "HEAD"])
+    info["branch"] = branch or None
+    rc, status = run_git(root, ["status", "--porcelain"])
+    if rc == 0:
+        changes = [l for l in status.splitlines() if l.strip()]
+        info["uncommitted_files"] = len(changes)
+    rc, upstream = run_git(root, ["rev-parse", "--abbrev-ref", "@{upstream}"])
+    info["has_upstream"] = rc == 0 and bool(upstream)
+    return info
+
+
+ENV_NAME = re.compile(r"^\.env(\.|$)|(^|/)\.env(\.|$)")
+
+
+def check_env_hygiene(root, git):
+    """.env files: error if tracked by git, warning if present but not
+    covered by .gitignore. Only runs inside git repos for the tracked check."""
+    errors, warnings = [], []
+    disk_envs = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in filenames:
+            if name == ".env" or name.startswith(".env."):
+                disk_envs.append(os.path.relpath(os.path.join(dirpath, name), root))
+    if not git.get("is_repo"):
+        return errors, warnings
+    rc, listing = run_git(root, ["ls-files"])
+    if rc == 0 and listing:
+        tracked = set(listing.splitlines())
+        for rel in disk_envs:
+            if rel in tracked:
+                errors.append({"kind": "env-tracked", "file": rel, "line": 0})
+    if disk_envs:
+        ignore_text = ""
+        gi = os.path.join(root, ".gitignore")
+        if os.path.isfile(gi):
+            with open(gi, "r", encoding="utf-8", errors="replace") as f:
+                ignore_text = f.read()
+        covered = any(p in ignore_text.splitlines() for p in
+                      (".env", ".env.*", "*.env", ".env*", ".env.*.local"))
+        for rel in disk_envs:
+            already = any(e["file"] == rel for e in errors)
+            if not covered and not already:
+                warnings.append({"kind": "env-not-ignored", "file": rel, "line": 0})
+    return errors, warnings
+
+
+def scan_secrets(root, ignore=None, ignored_paths=None, oversize=None):
+    errors, warnings = [], []
+    for path in iter_files(root, ignore, ignored_paths):
+        if is_binary(path):
+            continue
+        try:
+            text = read_text(path)
+        except OversizeFile:
+            if oversize is not None:
+                oversize.append(os.path.relpath(path, root))
+            continue
+        if text is None:
+            continue
+        rel = os.path.relpath(path, root)
+        for label, pattern in SECRET_PATTERNS:
+            for m in pattern.finditer(text):
+                line_no = text.count("\n", 0, m.start()) + 1
+                errors.append({"kind": "secret", "pattern": label,
+                               "file": rel, "line": line_no})
+        for m in GENERIC_SECRET.finditer(text):
+            value = m.group(1)
+            line_start = text.rfind("\n", 0, m.start()) + 1
+            line = text[line_start:text.find("\n", m.start()) if "\n" in text[m.start():] else len(text)]
+            low = value.lower()
+            if any(h in low for h in PLACEHOLDER_HINTS):
+                continue
+            if any(h in line for h in ENV_REF_HINTS):
+                continue
+            line_no = text.count("\n", 0, m.start()) + 1
+            warnings.append({"kind": "possible-credential", "file": rel,
+                             "line": line_no})
+    return errors, warnings
+
+
+def scan_residue(root, ignore=None, ignored_paths=None, oversize=None):
+    findings, todo_counts = [], {}
+    for path in iter_files(root, ignore, ignored_paths):
+        if is_binary(path):
+            continue
+        try:
+            text = read_text(path)
+        except OversizeFile:
+            if oversize is not None:
+                oversize.append(os.path.relpath(path, root))
+            continue
+        if text is None:
+            continue
+        rel = os.path.relpath(path, root)
+        ext = os.path.splitext(path)[1].lower()
+        for label, pattern in RESIDUE_PATTERNS.get(ext, []):
+            for m in pattern.finditer(text):
+                line_no = text.count("\n", 0, m.start()) + 1
+                findings.append({"kind": "debug-residue", "pattern": label,
+                                 "file": rel, "line": line_no})
+        n = len(TODO_PATTERN.findall(text))
+        if n:
+            todo_counts[rel] = n
+    return findings, todo_counts
+
+
+
+def python_check_command(root):
+    """Pick the repo's test command from repo evidence, not convention:
+    pytest when the repo signals pytest (config files, conftest, declared
+    dependency) or when it is installed and no tests/ dir suggests plain
+    unittest; otherwise unittest discovery when a tests/ dir exists."""
+    def contains(fname, needle):
+        path = os.path.join(root, fname)
+        if not os.path.isfile(path):
+            return False
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                return needle in f.read()
+        except OSError:
+            return False
+
+    pytest_signals = (
+        os.path.isfile(os.path.join(root, "conftest.py"))
+        or os.path.isfile(os.path.join(root, "tests", "conftest.py"))
+        or os.path.isfile(os.path.join(root, "pytest.ini"))
+        or contains("pyproject.toml", "pytest")
+        or contains("requirements.txt", "pytest")
+        or contains("setup.cfg", "pytest")
+        or contains("tox.ini", "pytest")
+    )
+    if pytest_signals:
+        return "python3 -m pytest"
+    if os.path.isdir(os.path.join(root, "tests")):
+        import importlib.util
+        if importlib.util.find_spec("pytest") is None:
+            return "python3 -m unittest discover -s tests"
+        return "python3 -m pytest"  # installed; pytest runs unittest suites too
+    return "python3 -m pytest"
+
+
+def detect_checks(root):
+    """Return (project_kinds, suggested_commands). Reads preflight.checks first."""
+    suggested, kinds = [], []
+    custom = os.path.join(root, "preflight.checks")
+    if os.path.isfile(custom):
+        with open(custom, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    suggested.append(line)
+        kinds.append("custom (preflight.checks)")
+        return kinds, suggested  # an explicit gate replaces auto-detection
+    pkg = os.path.join(root, "package.json")
+    if os.path.isfile(pkg):
+        kinds.append("node")
+        try:
+            with open(pkg, "r", encoding="utf-8", errors="replace") as f:
+                scripts = json.load(f).get("scripts", {})
+            if "test" in scripts:
+                suggested.append("npm test")
+            if "lint" in scripts:
+                suggested.append("npm run lint")
+            if "build" in scripts:
+                suggested.append("npm run build")
+        except (json.JSONDecodeError, OSError):
+            pass
+    if os.path.isfile(os.path.join(root, "pyproject.toml")) or \
+            os.path.isfile(os.path.join(root, "requirements.txt")):
+        kinds.append("python")
+        suggested.append(python_check_command(root))
+    if os.path.isfile(os.path.join(root, "go.mod")):
+        kinds.append("go")
+        suggested.append("go test ./...")
+    if os.path.isfile(os.path.join(root, "Cargo.toml")):
+        kinds.append("rust")
+        suggested.append("cargo test")
+    mk = os.path.join(root, "Makefile")
+    if os.path.isfile(mk):
+        try:
+            with open(mk, "r", encoding="utf-8", errors="replace") as f:
+                if re.search(r"^test\s*:", f.read(), re.M):
+                    kinds.append("make")
+                    suggested.append("make test")
+        except OSError:
+            pass
+    seen, deduped = set(), []
+    for cmd in suggested:
+        if cmd not in seen:
+            seen.add(cmd)
+            deduped.append(cmd)
+    return kinds, deduped
+
+
+def run_checks(root, commands, timeout=600):
+    results = []
+    for cmd in commands:
+        try:
+            proc = subprocess.run(cmd, shell=True, cwd=root, capture_output=True,
+                                  text=True, timeout=timeout)
+            results.append({"command": cmd, "exit_code": proc.returncode,
+                            "passed": proc.returncode == 0,
+                            "tail": (proc.stdout + proc.stderr).strip().splitlines()[-5:]})
+        except subprocess.TimeoutExpired:
+            results.append({"command": cmd, "exit_code": None, "passed": False,
+                            "tail": ["timed out after %ds" % timeout]})
+    return results
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="preflight",
+        description="Zero-dependency pre-ship gate: secrets, debug residue, "
+                    "project checks. Read-only unless --run-checks.")
+    parser.add_argument("path", nargs="?", default=".", help="repo path (default: .)")
+    parser.add_argument("--run-checks", action="store_true",
+                        help="run the repo's detected/preflight.checks commands")
+    parser.add_argument("--strict", action="store_true",
+                        help="exit 1 on warnings too")
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    parser.add_argument("--version", action="version", version="preflight " + VERSION)
+    args = parser.parse_args(argv)
+
+    root = os.path.abspath(args.path)
+    if not os.path.isdir(root):
+        print("preflight: not a directory: %s" % root, file=sys.stderr)
+        return 2
+
+    git = git_summary(root)
+    ignore = load_ignore(root)
+    ignored_paths = set()
+    oversize = []
+    secret_errors, cred_warnings = scan_secrets(root, ignore, ignored_paths, oversize)
+    residue, todos = scan_residue(root, ignore, ignored_paths, oversize)
+    env_errors, env_warnings = check_env_hygiene(root, git)
+    kinds, suggested = detect_checks(root)
+
+    check_results = []
+    if args.run_checks:
+        if not suggested:
+            cred_warnings.append({"kind": "checks",
+                                  "file": ".", "line": 0,
+                                  "note": "no checks detected; add a preflight.checks file"})
+        else:
+            if not args.json:
+                print("  note: --run-checks executes commands defined by this repo")
+                print("        (preflight.checks / package.json scripts). Only use")
+                print("        it on code you trust.")
+            check_results = run_checks(root, suggested)
+
+    failed_checks = [r for r in check_results if not r["passed"]]
+    errors = list(secret_errors) + list(env_errors)
+    for r in failed_checks:
+        errors.append({"kind": "check-failed", "command": r["command"],
+                       "exit_code": r["exit_code"], "tail": r["tail"]})
+    warnings = cred_warnings + residue + env_warnings
+    todo_total = sum(todos.values())
+
+    report = {
+        "version": VERSION,
+        "root": root,
+        "git": git,
+        "project": kinds,
+        "suggested_checks": suggested,
+        "checks_run": check_results,
+        "errors": errors,
+        "warnings": warnings,
+        "todo_fixme_total": todo_total,
+        "ignored_by_preflightignore": len(ignored_paths),
+        "skipped_oversize": sorted(set(oversize)),
+        "max_file_bytes": MAX_FILE_BYTES,
+        "ok": not errors and not (args.strict and warnings),
+    }
+
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print("preflight %s - %s" % (VERSION, root))
+        if git.get("is_repo"):
+            print("  git: branch=%s uncommitted=%s upstream=%s" % (
+                git.get("branch"), git.get("uncommitted_files", 0),
+                "yes" if git.get("has_upstream") else "no"))
+        else:
+            print("  git: not a git repo (scanning files anyway)")
+        print("  project: %s" % (", ".join(kinds) if kinds else "unrecognized"))
+        if suggested:
+            print("  suggested checks:")
+            for c in suggested:
+                print("    - %s" % c)
+        for r in check_results:
+            mark = "PASS" if r["passed"] else "FAIL"
+            print("  [%s] %s" % (mark, r["command"]))
+            if not r["passed"]:
+                for line in r["tail"]:
+                    print("        %s" % line)
+        for e in errors:
+            if e["kind"] == "secret":
+                print("  ERROR secret (%s) at %s:%s" % (e["pattern"], e["file"], e["line"]))
+            elif e["kind"] == "env-tracked":
+                print("  ERROR %s is tracked by git - remove it from history" % e["file"])
+            else:
+                print("  ERROR check failed: %s" % e.get("command"))
+        for w in warnings:
+            print("  warn  %s at %s:%s" % (w["kind"], w["file"], w["line"]))
+        if todo_total:
+            print("  note  %d TODO/FIXME markers across %d files" % (todo_total, len(todos)))
+        if ignored_paths:
+            print("  note  %d files excluded by .preflightignore" % len(ignored_paths))
+        if oversize:
+            print("  note  %d files over %d MB NOT scanned: %s" % (
+                len(set(oversize)), MAX_FILE_BYTES // (1024 * 1024),
+                ", ".join(sorted(set(oversize))[:5])))
+        if report["ok"] and not warnings and not errors and not oversize:
+            print("  CLEAR - nothing blocking. You still owe evidence the change works.")
+        elif report["ok"] and oversize and not errors and not warnings:
+            print("  CLEAR (partial scan - oversize files skipped). You still owe evidence.")
+        elif report["ok"]:
+            print("  CLEAR with warnings - review the warnings above.")
+        else:
+            print("  BLOCKED - fix the errors above before shipping.")
+
+    if errors or (args.strict and warnings):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

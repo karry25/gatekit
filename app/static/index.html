@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gatekit studio</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <div class="logo">gk</div>
+    <div>
+      <h1>gatekit studio</h1>
+      <p class="tag">Real pre-ship checks and repo briefings, on your machine.</p>
+    </div>
+  </div>
+  <nav>
+    <button class="tab active" data-tab="scan">Scan</button>
+    <button class="tab" data-tab="brief">Brief</button>
+    <button class="tab" data-tab="workflows">Workflows</button>
+    <button class="tab" data-tab="ratings">My ratings</button>
+  </nav>
+</header>
+
+<main>
+  <section id="tab-scan" class="panel active">
+    <div class="card">
+      <h2>Pre-ship scan</h2>
+      <p class="muted">Runs the real <code>preflight</code> gate: hard secret scan, credential
+      heuristics, debug residue, project detection with suggested checks (shown, not run
+      here), git state. Read-only; nothing is modified, nothing leaves this computer.</p>
+      <div class="row">
+        <input id="scan-path" type="text" placeholder="/path/to/your/project" autocomplete="off">
+        <button id="scan-btn" class="primary">Scan folder</button>
+      </div>
+      <div class="row">
+        <label class="upload">
+          <input id="scan-zip" type="file" accept=".zip">
+          <span>or scan an uploaded .zip (extracted to a temp folder, deleted after)</span>
+        </label>
+      </div>
+      <div id="scan-status" class="status"></div>
+      <div id="scan-result"></div>
+    </div>
+  </section>
+
+  <section id="tab-brief" class="panel">
+    <div class="card">
+      <h2>Repo brief</h2>
+      <p class="muted">Runs the real <code>brief</code> tool: one paste-ready briefing with the
+      repo's stack, layout, key files and the commands that prove it works. Paste it at the
+      start of any AI chat.</p>
+      <div class="row">
+        <input id="brief-path" type="text" placeholder="/path/to/your/project" autocomplete="off">
+        <button id="brief-btn" class="primary">Build brief</button>
+      </div>
+      <div id="brief-status" class="status"></div>
+      <div id="brief-result"></div>
+    </div>
+  </section>
+
+  <section id="tab-workflows" class="panel">
+    <div class="card">
+      <h2>Workflow library</h2>
+      <p class="muted">Nine structured prompt workflows. Fill in the inputs and get one
+      paste-ready prompt for any AI chat. Workflows run in your own AI tool and spend that
+      tool's tokens; nothing is executed here.</p>
+      <div id="workflow-list" class="wf-list"></div>
+    </div>
+    <div class="card hidden" id="wf-detail-card">
+      <button id="wf-back" class="ghost">&larr; all workflows</button>
+      <h2 id="wf-title"></h2>
+      <p class="muted" id="wf-purpose"></p>
+      <div id="wf-inputs"></div>
+      <button id="wf-render" class="primary">Compose prompt</button>
+      <div id="wf-output-wrap" class="hidden">
+        <div class="row spread">
+          <h3>Paste-ready prompt</h3>
+          <button id="wf-copy" class="ghost">Copy</button>
+        </div>
+        <pre id="wf-output" class="output"></pre>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-ratings" class="panel">
+    <div class="card">
+      <h2>My ratings</h2>
+      <p class="muted">Your ratings of scans, briefs and prompts. Stored only on this
+      computer in <code>app/data/ratings.json</code> - a record of what worked, so you can
+      see which workflows earn their keep.</p>
+      <div id="ratings-list"></div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <span>gatekit studio &middot; local only (127.0.0.1) &middot; read-only scans &middot;
+  <code>--run-checks</code> is not exposed here: it executes repo-defined commands, so run it
+  in your terminal, only on code you trust.</span>
+</footer>
+
+<div id="rate-modal" class="modal hidden">
+  <div class="modal-card">
+    <h3 id="rate-title">Rate this result</h3>
+    <div class="stars" id="rate-stars"></div>
+    <textarea id="rate-note" placeholder="What worked or didn't? (optional)"></textarea>
+    <div class="row spread">
+      <button id="rate-cancel" class="ghost">Skip</button>
+      <button id="rate-save" class="primary">Save rating</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

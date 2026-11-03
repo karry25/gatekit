@@ -1,0 +1,3 @@
+# demo config - both values below are fake, built to trip the scanner
+api_key = "DEMO-f8e2c91a47b63d05f9e1a2b4c6d8e0f2"
+service_token = "eyJhbGciOiJIUzI1NiJ9.eyJkZW1vIjoidHJ1ZSJ9.c2lnbmF0dXJl"

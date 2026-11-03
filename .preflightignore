@@ -1,0 +1,3 @@
+# The demo repo plants fake secrets on purpose; don't let gatekit's own
+# dogfood gate block on them.
+examples/demo-repo/config.txt
